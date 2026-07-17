@@ -13,7 +13,6 @@ print("Please wait...")
 
 model_id = "openai/clip-vit-base-patch32"
 
-# Added local_files_only=False explicitly to trigger downloading logs
 model = CLIPModel.from_pretrained(model_id)
 processor = CLIPProcessor.from_pretrained(model_id)
 
@@ -23,12 +22,10 @@ print("\n-> Model loaded successfully!")
 search_image_path = "searchimage.jpg"
 database_folder = "images"
 
-# Check if search image exists
 if not os.path.exists(search_image_path):
     print(f"ERROR: Cannot find '{search_image_path}' in this folder!")
     exit()
 
-# Check if images folder exists
 if not os.path.exists(database_folder):
     print(f"ERROR: Cannot find the '{database_folder}' folder!")
     exit()
@@ -49,38 +46,48 @@ if len(database_images) == 0:
 
 print(f"-> Successfully loaded {len(database_images)} database images.")
 
-# 3. Process images
 
-print("-> Comparing images using AI math...")
-inputs = processor(images=[search_image] + database_images, return_tensors="pt")
-
-with torch.no_grad():
-    output = model.get_image_features(**inputs)
-
+def extract_features(output):
+    """
+    Different transformers versions return different object types from
+    get_image_features() / get_text_features(). This normalizes all of
+    them down to a plain tensor.
+    """
     if torch.is_tensor(output):
-        image_features = output
-    elif hasattr(output, 'image_embeds') and output.image_embeds is not None:
-        image_features = output.image_embeds
-    elif hasattr(output, 'pooler_output') and output.pooler_output is not None:
-        image_features = output.pooler_output
-    else:
-        raise TypeError(f"Unexpected output type from get_image_features: {type(output)}")
+        return output
+    if hasattr(output, 'image_embeds') and output.image_embeds is not None:
+        return output.image_embeds
+    if hasattr(output, 'text_embeds') and output.text_embeds is not None:
+        return output.text_embeds
+    if hasattr(output, 'pooler_output') and output.pooler_output is not None:
+        return output.pooler_output
+    if hasattr(output, 'last_hidden_state') and output.last_hidden_state is not None:
+        return output.last_hidden_state
+    raise TypeError(f"Unexpected output type: {type(output)}")
 
-# Now we perform the math on the extracted tensor
-# .float() ensures the numbers are in the right format for torch.cosine_similarity
-image_features = image_features.float()
 
-# Normalization makes the comparison math much more accurate
-image_features /= image_features.norm(dim=-1, keepdim=True)
+# 3. Process images and text
+print("-> Comparing images using AI math...")
 
-search_vector = image_features[0].unsqueeze(0)
-database_vectors = image_features[1:]
+# A. Calculate Image Features for the database
+image_inputs = processor(images=database_images, return_tensors="pt")
+with torch.no_grad():
+    img_out = model.get_image_features(**image_inputs)
+    image_features = extract_features(img_out).float()
+    image_features /= image_features.norm(dim=-1, keepdim=True)
 
-similarity_scores = torch.nn.functional.cosine_similarity(search_vector, database_vectors)
+# B. Calculate Text Features for the query
+text_query = 'Birthday theme with grey, white colours and strictly including animals'
+text_inputs = processor(text=[text_query], return_tensors="pt", padding=True)
+with torch.no_grad():
+    txt_out = model.get_text_features(**text_inputs)
+    text_features = extract_features(txt_out).float()
+    text_features /= text_features.norm(dim=-1, keepdim=True)
 
-print(similarity_scores)
+# C. Compare the text vector to all image vectors
+similarity_scores = torch.nn.functional.cosine_similarity(text_features, image_features)
 
-# Pair each score with its filename and sort by similarity (highest first)
+# D. Pair and sort
 results = list(zip(image_names, similarity_scores.tolist()))
 results.sort(key=lambda x: x[1], reverse=True)
 
